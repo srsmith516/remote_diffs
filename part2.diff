@@ -1,0 +1,239 @@
+diff --git a/kernel/file.c b/kernel/file.c
+index e8dcf17..7fbbd0f 100644
+--- a/kernel/file.c
++++ b/kernel/file.c
+@@ -16,7 +16,7 @@
+ struct devsw devsw[NDEV];
+ struct {
+   struct spinlock lock;
+-  struct file file[NFILE];
++  //removed NFILE limit on open files, will use buddy allocator instead 
+ } ftable;
+ 
+ void
+@@ -31,16 +31,16 @@ filealloc(void)
+ {
+   struct file *f;
+ 
+-  acquire(&ftable.lock);
+-  for(f = ftable.file; f < ftable.file + NFILE; f++){
+-    if(f->ref == 0){
+-      f->ref = 1;
+-      release(&ftable.lock);
+-      return f;
+-    }
++  acquire(&ftable.lock);				//Need to acquire spinlock to access f->ref
++  f = (struct file*)bd_malloc(sizeof(struct file));	//Allocate memory of size file and let f point to it
++  if(f->ref == 0){					//increase the file refence count and return
++	  memset(f,0,sizeof(struct file));                      //Zero out memory
++	  f->ref = 1;
++	  release(&ftable.lock);                                //Relase the lock
++	  return f;
+   }
+-  release(&ftable.lock);
+-  return 0;
++  release(&ftable.lock);				//Relase the lock
++  return 0;						
+ }
+ 
+ // Increment ref count for file f.
+@@ -71,15 +71,16 @@ fileclose(struct file *f)
+   ff = *f;
+   f->ref = 0;
+   f->type = FD_NONE;
++  bd_free(f);		//Free memory allocated by filealloc. Do this inside the lock as to not free files in use.
+   release(&ftable.lock);
+-
++  
+   if(ff.type == FD_PIPE){
+     pipeclose(ff.pipe, ff.writable);
+   } else if(ff.type == FD_INODE || ff.type == FD_DEVICE){
+     begin_op(ff.ip->dev);
+     iput(ff.ip);
+     end_op(ff.ip->dev);
+-  }
++    }
+ }
+ 
+ // Get metadata about file f.
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index e8bcda9..f0d097b 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -43,12 +43,15 @@ sys_sbrk(void)
+ {
+   int addr;
+   int n;
++  struct proc *p = myproc();
+ 
+   if(argint(0, &n) < 0)
+     return -1;
+-  addr = myproc()->sz;
+-  if(growproc(n) < 0)
+-    return -1;
++  addr = p->sz;			//Incriment the size of process by n instead of allocating memory
++  p->sz += n;			
++  if( n < 0){			//handle negative sbrk() arguments by deallocating memory
++	uvmdealloc(p->pagetable, addr, p->sz);
++  }
+   return addr;
+ }
+ 
+diff --git a/kernel/trap.c b/kernel/trap.c
+index 51a7805..e541d49 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -67,7 +67,23 @@ usertrap(void)
+     syscall();
+   } else if((which_dev = devintr()) != 0){
+     // ok
+-  } else {
++  } else if((r_scause() == 13) || (r_scause() == 15))	//If there is a pagefault, do lazy allocation
++  {
++  uint64 addr = PGROUNDDOWN(r_stval());			//start allocation at the page boundry under the faulting address
++  char* mem; 
++  mem = kalloc();
++    if(mem == 0 || r_stval()  >= p->sz || r_stval()  < PGROUNDDOWN(p->tf->sp)){	//kill the process if kalloc() fails or r_stval() is out of bounds
++      p->killed = 1;
++    }
++    else{
++    memset(mem, 0, PGSIZE);			//zero out the memory
++    if(mappages(p->pagetable, addr, PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R|PTE_U) != 0){	//Map the allocated memory to the process's page table
++      kfree(mem);										//If mapping fails, free the memory allocated by kalloc()
++      p->killed = 1;										//and kill the process
++    }
++    }
++  } 
++  else {
+     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+     p->killed = 1;
+diff --git a/kernel/vm.c b/kernel/vm.c
+index 2b99c8b..446c20b 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -5,7 +5,8 @@
+ #include "riscv.h"
+ #include "defs.h"
+ #include "fs.h"
+-
++#include "spinlock.h"
++#include "proc.h"
+ /*
+  * the kernel's page table.
+  */
+@@ -79,7 +80,7 @@ static pte_t *
+ walk(pagetable_t pagetable, uint64 va, int alloc)
+ {
+   if(va >= MAXVA)
+-    panic("walk");
++   panic("walk");
+ 
+   for(int level = 2; level > 0; level--) {
+     pte_t *pte = &pagetable[PX(level, va)];
+@@ -103,15 +104,31 @@ walkaddr(pagetable_t pagetable, uint64 va)
+ {
+   pte_t *pte;
+   uint64 pa;
++ 
++  if(va >= MAXVA)
++	  return 0;
+ 
+   pte = walk(pagetable, va, 0);
+-  if(pte == 0)
+-    return 0;
+-  if((*pte & PTE_V) == 0)
+-    return 0;
+-  if((*pte & PTE_U) == 0)
+-    return 0;
++  //If there is no page table entry at va, or the page is not there,
++  //allocate one, map it, and return the page address.
++  if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0 ){
++  	struct proc *p = myproc();
++  	char* mem;
++  	mem = kalloc();
++    	if(mem == 0 || va >= p->sz || va < PGROUNDDOWN(p->tf->sp)){	//kill the processes if kalloc() fails or va is out of bounds
++      		p->killed = 1;
++		exit(-1);
++     	}
++    	memset(mem, 0, PGSIZE);
++    	if(mappages(p->pagetable, va, PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R|PTE_U) != 0){	//return 0 and free memory is mapping not sucessful
++      		kfree(mem);
++      		return 0;
++    	}
++	pa = (uint64)mem;
++  }
++  else{	//return the page address at the page table entry if no lazy allocation was required
+   pa = PTE2PA(*pte);
++  }
+   return pa;
+ }
+ 
+@@ -184,11 +201,11 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 size, int do_free)
+   a = PGROUNDDOWN(va);
+   last = PGROUNDDOWN(va + size - 1);
+   for(;;){
+-    if((pte = walk(pagetable, a, 0)) == 0)
+-      panic("uvmunmap: walk");
++    if((pte = walk(pagetable, a, 0)) == 0){
++	   goto next_page;	//Go to the next page instead of panicing when there is no page table entry
++    }
+     if((*pte & PTE_V) == 0){
+-      printf("va=%p pte=%p\n", a, *pte);
+-      panic("uvmunmap: not mapped");
++     goto next_page;		//Or if the page isn't there
+     }
+     if(PTE_FLAGS(*pte) == PTE_V)
+       panic("uvmunmap: not a leaf");
+@@ -197,6 +214,7 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 size, int do_free)
+       kfree((void*)pa);
+     }
+     *pte = 0;
++next_page:
+     if(a == last)
+       break;
+     a += PGSIZE;
+@@ -318,10 +336,12 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+   char *mem;
+ 
+   for(i = 0; i < sz; i += PGSIZE){
+-    if((pte = walk(old, i, 0)) == 0)
+-      panic("uvmcopy: pte should exist");
+-    if((*pte & PTE_V) == 0)
+-      panic("uvmcopy: page not present");
++    if((pte = walk(old, i, 0)) == 0){	//Continue instead of panic if there is no page table entry
++      continue;
++    }
++    if((*pte & PTE_V) == 0){		//Contiue instead of panic if there is no page at the pte
++      continue;
++    }
+     pa = PTE2PA(*pte);
+     flags = PTE_FLAGS(*pte);
+     if((mem = kalloc()) == 0)
+@@ -361,7 +381,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+   uint64 n, va0, pa0;
+ 
+   while(len > 0){
+-    va0 = (uint)PGROUNDDOWN(dstva);
++    va0 = (uint64)PGROUNDDOWN(dstva);
+     pa0 = walkaddr(pagetable, va0);
+     if(pa0 == 0)
+       return -1;
+@@ -386,7 +406,7 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
+   uint64 n, va0, pa0;
+ 
+   while(len > 0){
+-    va0 = (uint)PGROUNDDOWN(srcva);
++    va0 = (uint64)PGROUNDDOWN(srcva);
+     pa0 = walkaddr(pagetable, va0);
+     if(pa0 == 0)
+       return -1;
+@@ -413,7 +433,7 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+   int got_null = 0;
+ 
+   while(got_null == 0 && max > 0){
+-    va0 = (uint)PGROUNDDOWN(srcva);
++    va0 = (uint64)PGROUNDDOWN(srcva);
+     pa0 = walkaddr(pagetable, va0);
+     if(pa0 == 0)
+       return -1;
