@@ -1,0 +1,229 @@
+diff --git a/kernel/file.h b/kernel/file.h
+index 92f6198..1251658 100644
+--- a/kernel/file.h
++++ b/kernel/file.h
+@@ -27,7 +27,7 @@ struct inode {
+   short minor;
+   short nlink;
+   uint size;
+-  uint addrs[NDIRECT+1];
++  uint addrs[NDIRECT+1+1];
+ };
+ 
+ // map major device number to device functions.
+diff --git a/kernel/fs.c b/kernel/fs.c
+index 53586d5..ae003d9 100644
+--- a/kernel/fs.c
++++ b/kernel/fs.c
+@@ -380,13 +380,14 @@ bmap(struct inode *ip, uint bn)
+ {
+   uint addr, *a;
+   struct buf *bp;
++  struct buf *bp2;
+ 
+   if(bn < NDIRECT){
+     if((addr = ip->addrs[bn]) == 0)
+       ip->addrs[bn] = addr = balloc(ip->dev);
+     return addr;
+   }
+-  bn -= NDIRECT;
++  bn -= (NDIRECT);
+ 
+   if(bn < NINDIRECT){
+     // Load indirect block, allocating if necessary.
+@@ -401,6 +402,30 @@ bmap(struct inode *ip, uint bn)
+     brelse(bp);
+     return addr;
+   }
++  bn -= NINDIRECT;
++  //Double Indirect Block
++  if(bn < (NINDIRECT*NINDIRECT)){
++    //Load double indirect block, allocating if necessary.
++    if((addr = ip->addrs[NDIRECT+1]) == 0)
++	ip->addrs[NDIRECT+1] = addr = balloc(ip->dev);
++    //Inner Block
++    bp = bread(ip->dev,addr);
++    a = (uint*)bp->data;
++    if((addr = a[bn / NINDIRECT]) == 0){
++    	a[bn / NINDIRECT] = addr = balloc(ip->dev);
++	log_write(bp);
++    }
++    brelse(bp);
++    //Outer Block
++    bp2 = bread(ip->dev,addr);
++    a = (uint*)bp2->data;
++    if((addr = a[bn%NINDIRECT]) == 0){
++	a[bn%NINDIRECT] = addr = balloc(ip->dev);
++	log_write(bp2);
++    }
++    brelse(bp2);
++    return addr;
++  }
+ 
+   panic("bmap: out of range");
+ }
+@@ -413,11 +438,13 @@ bmap(struct inode *ip, uint bn)
+ static void
+ itrunc(struct inode *ip)
+ {
+-  int i, j;
++  int i, j, k;
+   struct buf *bp;
++  struct buf *bp2;
+   uint *a;
++  uint *a2;
+ 
+-  for(i = 0; i < NDIRECT; i++){
++  for(i = 0; i < (NDIRECT); i++){
+     if(ip->addrs[i]){
+       bfree(ip->dev, ip->addrs[i]);
+       ip->addrs[i] = 0;
+@@ -435,7 +462,28 @@ itrunc(struct inode *ip)
+     bfree(ip->dev, ip->addrs[NDIRECT]);
+     ip->addrs[NDIRECT] = 0;
+   }
+-
++ 
++  //Double Indirect 
++  if(ip->addrs[NDIRECT+1]){
++	bp = bread(ip->dev, ip->addrs[NDIRECT+1]);
++	a = (uint*)bp->data;
++	for(j = 0; j < NINDIRECT; j++){	//Inside Block
++		if(a[j]){
++			bp2 = bread(ip->dev, a[j]);
++			a2 = (uint*)bp2->data;
++			for(k = 0; k < NINDIRECT; k++){	//Outside Block
++				if(a2[k]){
++					bfree(ip->dev, a2[k]);
++				}
++			}
++			brelse(bp2);
++			bfree(ip->dev, a[j]);
++		}
++	}
++	brelse(bp);
++	bfree(ip->dev, ip->addrs[NDIRECT+1]);
++	ip->addrs[NDIRECT+1] = 0;
++  }
+   ip->size = 0;
+   iupdate(ip);
+ }
+diff --git a/kernel/fs.h b/kernel/fs.h
+index 139dcc9..0dfd2ba 100644
+--- a/kernel/fs.h
++++ b/kernel/fs.h
+@@ -24,9 +24,9 @@ struct superblock {
+ 
+ #define FSMAGIC 0x10203040
+ 
+-#define NDIRECT 12
++#define NDIRECT 11   //Reduced size
+ #define NINDIRECT (BSIZE / sizeof(uint))
+-#define MAXFILE (NDIRECT + NINDIRECT)
++#define MAXFILE (NDIRECT + NINDIRECT + (NINDIRECT*NINDIRECT))	//includes double indirect
+ 
+ // On-disk inode structure
+ struct dinode {
+@@ -35,7 +35,7 @@ struct dinode {
+   short minor;          // Minor device number (T_DEVICE only)
+   short nlink;          // Number of links to inode in file system
+   uint size;            // Size of file (bytes)
+-  uint addrs[NDIRECT+1];   // Data block addresses
++  uint addrs[NDIRECT+1+1];   // Data block addresses (+1 for reduced size)
+ };
+ 
+ // Inodes per block.
+diff --git a/kernel/sysfile.c b/kernel/sysfile.c
+index 9d95ac9..97a9278 100644
+--- a/kernel/sysfile.c
++++ b/kernel/sysfile.c
+@@ -254,6 +254,7 @@ create(char *path, short type, short major, short minor)
+     ilock(ip);
+     if(type == T_FILE && (ip->type == T_FILE || ip->type == T_DEVICE))
+       return ip;
++    if(type == T_SYMLINK) return ip;
+     iunlockput(ip);
+     return 0;
+   }
+@@ -286,7 +287,29 @@ create(char *path, short type, short major, short minor)
+ uint64
+ sys_symlink(void)
+ {
+-  //your implementation goes here
++  //Get the syscall parameters
++  char target[MAXPATH];
++  char path[MAXPATH];
++  if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
++    return -1;
++  //Create Inode that has type T_SYMLINK
++  begin_op(ROOTDEV);
++  struct inode *ip = create(path, T_SYMLINK, 0, 0);
++  if(ip == 0){
++	end_op(ROOTDEV);
++	return -1;
++  }
++  //Write the meta data into this inode
++  //	3.1 write the length of the path
++    int len = strlen(target);
++    writei(ip, 0, (uint64)&len, 0, sizeof(int));
++  //    3.2 write the path of the target
++    writei(ip, 0, (uint64)target, sizeof(int), len+1);
++
++  //4. flush the in-memory inode into disk.
++  iupdate(ip);
++  iunlockput(ip);
++  end_op(ROOTDEV);
+   return 0;
+ }
+ 
+@@ -336,6 +359,30 @@ sys_open(void)
+     end_op(ROOTDEV);
+     return -1;
+   }
++  
++  //If this is a symbolic link follow it
++  if( (ip->type == T_SYMLINK) && !(omode & O_NOFOLLOW)){
++            int depth = 0;
++            while(ip->type == T_SYMLINK){ //Loop if we read another symlink
++                int len = 0;
++                readi(ip, 0, (uint64)&len, 0, sizeof(int));	//Read length
++                if (len > MAXPATH) panic("open symlink: symbolic file too big");
++                readi(ip, 0, (uint64)path, sizeof(int),len);	//Then Path
++                iunlockput(ip);
++                if((ip = namei(path)) == 0){
++                        end_op(ROOTDEV);
++                        return -1;
++                }
++                ilock(ip);
++                depth++;
++                if(depth >= 10){	//If more than 10 symlinks in a row, assume its a cycle and exit
++                        printf("cycle\n");
++                        iunlockput(ip);
++                        end_op(ROOTDEV);
++                        return -1;
++                }
++               }
++  }
+ 
+   if(ip->type == T_DEVICE){
+     f->type = FD_DEVICE;
+diff --git a/user/usertests.c b/user/usertests.c
+index 3f25eab..92d5905 100644
+--- a/user/usertests.c
++++ b/user/usertests.c
+@@ -181,7 +181,6 @@ void
+ writebig(char *s)
+ {
+   int i, fd, n;
+-
+   fd = open("big", O_CREATE|O_RDWR);
+   if(fd < 0){
+     printf("%s: error: creat big failed!\n", s);
+@@ -197,7 +196,6 @@ writebig(char *s)
+   }
+ 
+   close(fd);
+-
+   fd = open("big", O_RDONLY);
+   if(fd < 0){
+     printf("%s: error: open big failed!\n", s);
